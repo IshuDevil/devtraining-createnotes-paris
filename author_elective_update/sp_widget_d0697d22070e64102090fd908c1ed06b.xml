@@ -1,0 +1,1403 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sp_widget">
+    <sp_widget action="DELETE">
+        <category>sc</category>
+        <client_script><![CDATA[function($scope, $http, $timeout, $location, spScUtil, nowAttachmentHandler, spUtil, $log, spAriaUtil, $q, spAtf, spModal, spAriaFocusManager, cabrillo, snAnalytics) {
+  var c = this;
+	c.showSpecialInstructions = false;
+	c.showDeliveryAddr = false;
+	c.isNative = cabrillo.isNative() && c.data.isMEE;
+	
+	c.updateDetails = function() {
+		c.deliverTo = c.data.cart.delivery_address;
+		c.special_instructions = c.data.cart.special_instructions;
+		c.requestedFor = {
+			displayValue: c.data.cart.requested_for_display_name,
+			value: c.data.cart.requested_for,
+			name: 'requested_for'
+		};
+	}
+	
+	
+	spAtf.init().then(function(atf) {
+		$scope._atf = atf;
+		atf.expose('checkout_util', checkoutUtil);
+	});
+	
+	var checkoutUtil = {
+		checkout: function() {
+			var defer = $q.defer();
+			$scope.c.triggerCheckout();
+			var cleanUp;
+			var isOrderGuide = c.data.action == 'order_guide';
+			if(isOrderGuide)
+				cleanUp = $scope.$on('$sp.sc_order_guide.submitted', function(o, result) {
+					$timeout(function() {
+						cleanUp();
+						defer.resolve(result);
+					}, 10);
+				});
+			else
+				cleanUp = $scope.$on('$sp.sc_cat_item.submitted', function(o, result) {
+					$timeout(function() {
+						cleanUp();
+						defer.resolve(result);
+					}, 10);
+				});
+			return defer.promise;
+		}
+	}
+	
+	$scope.$on('dialog.upload_too_large.show', function(e){
+		$log.error($scope.m.largeAttachmentMsg);
+		spUtil.addErrorMessage($scope.m.largeAttachmentMsg);
+	});
+
+	$scope.m = $scope.data.msgs;
+	$scope.checkOutMsg = $scope.m.checkOutMsg;
+	$scope.checkoutPopupTitle = $scope.m.checkoutPopupTitle;
+	
+	displayNativeButtons();
+	
+	var ah = $scope.attachmentHandler = new nowAttachmentHandler(function (attachments, action) {
+		$scope.attachments = attachments;
+		if (action === "added")
+			$scope.setFocusToAttachment();
+		if (action === "renamed")
+			spAriaUtil.sendLiveMessage($scope.m.renameSuccessMsg);
+		if (action === "deleted")
+			spAriaUtil.sendLiveMessage($scope.m.deleteSuccessMsg);
+		spUtil.get($scope, {action: "from_attachment"});
+	}, function (error) {
+		spUtil.addErrorMessage(error.msg + error.fileName);
+	});
+	
+	ah.setParams('sc_cart', c.data.cart.sys_id, 1024 * 1024 * $scope.data.maxAttachmentSize);
+	
+	$scope.attachmentHandler.getAttachmentList();
+
+	$scope.confirmDeleteAttachment = function(attachment) {
+		if (c.isNative) {
+			if (confirm($scope.data.msgs.delete_attachment)) {
+				$scope.attachmentHandler.deleteAttachment(attachment);
+				$scope.setFocusToAttachmentButton();
+			}			
+		} else {
+			spModal.confirm($scope.data.msgs.delete_attachment).then(function() {
+				$scope.attachmentHandler.deleteAttachment(attachment);
+				$scope.setFocusToAttachmentButton();
+			});
+		}
+	}
+
+	c.changeShippingInfo = function() {
+		if (c.data.action !== 'order_now')
+			c.server.get({
+						action: "change_shipping_info",
+						requestedFor: c.requestedFor.value,
+						special_instructions: c.special_instructions,
+						deliverTo: c.deliverTo,
+						cart: {name: c.data.cart.name}
+					}).then(function(response) {
+						c.data.cart = response.data.cart;
+						c.updateDetails();
+					});
+	}
+	
+	c.triggerCheckout = function() {
+		var newURL;
+		c.checkoutInProgress = true;
+		putCheckingOutBtn();
+		var webAnalyticsMsgSuffix = c.isNative ? " - NOW Mobile" : ""; 
+		var additionalParms = {'sysparm_requested_for': c.requestedFor.value,
+													 'special_instructions': c.special_instructions,
+													 'delivery_address': c.deliverTo
+													};
+		if (c.data.parentParams) {
+				additionalParms.sysparm_parent_sys_id =  c.data.parentParams.sysparm_parent_sys_id;
+				additionalParms.sysparm_parent_table = c.data.parentParams.sysparm_parent_table;
+		}
+		if (c.data.action == 'order_now') {
+			spScUtil.orderNow(c.data.item.sys_id, c.data.item.quantity, c.data.item.fields, c.data.item.newRecordID, additionalParms).then(function(response) {
+				$scope.server.get({
+					action: 'log_request',
+					itemDetails: {
+						sys_id: $scope.data.item.sys_id,
+						name: $scope.data.item.name,
+						sys_class_name: $scope.data.item.sys_class_name
+					}
+				});
+				var a = response.data.result;
+				if (!$scope.data.parentParams)
+					$scope.$emit("$$uiNotification", a.$$uiNotification);
+				$scope.$emit("$sp.sc_cat_item.submitted", a);
+				// build and send payload for instrumentation
+				var payload= {};
+				payload.name = "Submit Catalog Request";
+				payload.data = {};
+				payload.data["Catalog Title"] = c.data.item.title;
+				payload.data["Catalog SysID"] = c.data.item.sys_id;
+				payload.data["Shopping Cart"] = "false";
+				snAnalytics.addEvent(payload);
+				
+				if (c.options.auto_redirect == 'false') {
+					$rootScope.$broadcast("$sp.service_catalog.cart.submitted", true);
+					spUtil.addInfoMessage($scope.m.requestSubmitted);
+					return;
+				} else if (!$scope._atf) {
+					removeCabrilloButtons();
+					newURL = $location.search('id=sc_request&is_new_order=true&table=sc_request&sys_id=' + a.sys_id);
+					spAriaFocusManager.navigateToLink(newURL.url());
+				}
+			}, function(response) {
+				c.cancel();
+				if (response.data.result && response.data.result.errMsg)
+					spUtil.addErrorMessage(response.data.result.errMsg);
+			});
+		} else if (c.data.action == 'order_now_wishlisted_item') {
+			spScUtil.orderWishlistedItem(c.data.item.sys_id, c.data.item.quantity, c.data.item.fields, c.data.item.newRecordID, additionalParms).then(function(response) {
+				$scope.server.get({
+					action: 'log_request',
+					itemDetails: {
+						sys_id: $scope.data.item.sys_id,
+						name: $scope.data.item.name,
+						sys_class_name: $scope.data.item.sys_class_name
+					}
+				});
+				var a = response.data.result;
+				if (!$scope.data.parentParams)
+					$scope.$emit("$$uiNotification", a.$$uiNotification);
+				$scope.$emit("$sp.sc_cat_item.submitted", a);
+				$rootScope.$broadcast("$sp.service_catalog.wishlist.update");
+				if (c.options.auto_redirect == 'false') {
+					$rootScope.$broadcast("$sp.service_catalog.cart.submitted", true);
+					spUtil.addInfoMessage($scope.m.requestSubmitted);
+					return;
+				} else {
+					newURL = $location.search('id=sc_request&is_new_order=true&table=sc_request&sys_id=' + a.sys_id);
+					spAriaFocusManager.navigateToLink(newURL.url());
+				}
+			});
+		}
+		else {
+			c.data.delivery_address = c.deliverTo;
+			c.data.special_instructions = c.special_instructions;
+			c.data.requested_for = c.requestedFor.value;
+			var isOrderGuide = c.data.action == 'order_guide';
+			c.server.update().then(function(response) {
+				if (!response.result)
+					return;
+				
+				// build and send payload for instrumentation
+				var cartData = c.data.cartData;
+				var cartDataLen = c.data.cartData.length;
+				for (var i = 0; i < cartDataLen; i++) {
+					var payload= {};
+					payload.name = "Submit Catalog Request";
+					payload.data = {};
+					payload.data["Catalog Title"] = cartData[i].title;
+					payload.data["Catalog SysID"] = cartData[i].sys_id;
+					payload.data["Catalog Cart SysID"] = cartData[i].cartID;
+					payload.data["Shopping Cart"] = "true";
+					snAnalytics.addEvent(payload);
+				}
+				
+				c.data.action = null;
+				if (isOrderGuide) {
+					window.GlideWebAnalytics.trackEvent("Service Catalog", "Order Guide Request" + webAnalyticsMsgSuffix, "Catalog Request Submitted", $scope.data.item.items.length, 0);
+					$scope.$emit("$sp.sc_order_guide.submitted", $scope.data.result);
+				}
+				else {
+					window.GlideWebAnalytics.trackEvent("Service Catalog", "Catalog Cart" + webAnalyticsMsgSuffix, "Catalog Request Submitted", c.data.numberOfCartItems, 0);
+					$scope.$emit("$sp.cart.submitted", $scope.data.result);
+				}
+				if (c.options.auto_redirect == 'false') {
+					$rootScope.$broadcast("$sp.service_catalog.cart.update");
+					$rootScope.$broadcast("$sp.service_catalog.cart.submitted", true);
+					spUtil.addInfoMessage($scope.m.requestSubmitted);
+					return;
+				}
+				else {
+					if ($scope.data.result.sys_id) 
+						newURL = $location.search('id=sc_request&is_new_order=true&table=sc_request&sys_id=' + $scope.data.result.sys_id);
+					else 
+						newURL = $location.search('id=requests');
+					
+					removeCabrilloButtons();
+					spAriaFocusManager.navigateToLink(newURL.url());
+
+					$timeout(function(){
+						$rootScope.$broadcast("$sp.service_catalog.cart.update");
+						$rootScope.$broadcast("$sp.service_catalog.cart.submitted", true);						
+					})
+
+				}
+			});
+		}
+	}
+
+	$scope.$on("field.change", function(evt, parms) {
+		if (parms.field.name == 'requested_for') {
+			c.data.cart.requested_for = parms.newValue;
+			var getShippingAddrURL = '/api/sn_sc/v1/servicecatalog/cart/delivery_address/' + parms.newValue;
+			$http.get(getShippingAddrURL).then(function handleSuccess(response) {
+				if (response.data.result) {
+					c.deliverTo = response.data.result.trim();
+				} else {
+					c.deliverTo = '';
+				}
+				c.changeShippingInfo();
+			});
+		}
+	});
+
+	c.cancel = function() {
+		if (c.isNative) {
+			cabrillo.viewLayout.setTitle(c.oldTitle);
+			removeCabrilloButtons();
+		}
+		$rootScope.$broadcast("$sp.service_catalog.cart.cancel_order", true);
+	}
+
+	c.allowDeliveryAddress = function () {
+		if (c.data.item)
+			return c.data.item.request_method != "request"
+		return true;
+	}
+	
+	var mespClosePopupUnregister = $rootScope.$on("mesp.popup.close", function() {
+		// Timeout is to give a better user experience otherwise when this popup opens,
+		// the cabrillo buttons will be displayed immediately giving a bad user experience.
+		$timeout(function(){
+			displayNativeButtons();
+		});
+	});
+	
+	var mespOpenPopupUnregister = $rootScope.$on("mesp.popup.open", function() {
+		// Timeout is to give a better user experience otherwise when this popup opens,
+		// the cabrillo buttons will be displayed immediately giving a bad user experience.
+		$timeout(function(){
+			removeCabrilloButtons();
+		});
+	});
+	
+	$scope.$on("$destroy", function() {
+		mespClosePopupUnregister();
+		mespOpenPopupUnregister();
+	});
+	
+	function removeCabrilloButtons() {
+		 if (c.isNative)
+			 cabrillo.viewLayout.setBottomButtons();
+	}
+	
+	function displayNativeButtons() {
+			if (c.isNative) {
+					if (typeof cabrillo.viewLayout.getTitle == 'function') {
+						cabrillo.viewLayout.getTitle().then(function(title) {
+							c.oldTitle = title;
+							cabrillo.viewLayout.setTitle($scope.checkoutPopupTitle);
+						});
+					}
+					var buttons = [
+						{
+							title: $scope.m.dialogCancel,
+							enabled: true,
+							backgroundColor: '#f7f7f7',
+							textColor: '#000000'
+						},
+						{
+							title: $scope.checkOutMsg,
+							enabled: true,
+							backgroundColor: $scope.data.sys_properties.mobileNativeColor,
+							textColor: '#FFFFFF'
+						}
+					];
+					cabrillo.viewLayout.hideBackButton();
+					cabrillo.viewLayout.setNavigationBarButtons();
+					cabrillo.viewLayout.setBottomButtons(buttons, function(buttonIndex) {
+						if (buttonIndex == 0) {
+							c.cancel();
+						}
+						else {
+							c.triggerCheckout();
+						}
+					});
+				}
+	}
+	
+	function putCheckingOutBtn() {
+			if (c.isNative) {
+					var buttons = [
+										{
+												title: $scope.m.dialogCancel,
+												enabled: false,
+											  backgroundColor: '#f7f7f7',
+												textColor: '#000000'
+										},
+										{
+												title: $scope.m.checkingOutMsg,
+												enabled: false,
+												backgroundColor: $scope.data.sys_properties.mobileNativeColor,
+												textColor: '#FFFFFF'
+										}
+								];
+
+			  cabrillo.viewLayout.setBottomButtons(buttons, function(buttonIndex) {});
+			}
+	}
+
+	c.updateDetails();
+}]]></client_script>
+        <controller_as>c</controller_as>
+        <css>.attachment-list {
+  	max-height: 180px;
+  	overflow-y: scroll;
+  	margin-bottom: 10px;
+}
+
+.accordion-toggle {
+  	line-height: 13px;
+}
+
+textarea {
+	resize: vertical;
+}
+
+.select2-additional-display-field {
+  	padding-right: 5px;
+}
+
+.full-height {
+  	height: -webkit-fill-available;
+}
+
+.attachment-height {
+ 		 height: 80px;
+}
+
+.flex-center {
+  	display: flex;
+  	justify-content: center;
+  	align-items: center;
+}
+
+.select2-choice{
+  .select2-arrow {
+    right: 0px !important;
+  }
+}</css>
+        <data_table>sp_instance</data_table>
+        <demo_data/>
+        <description/>
+        <docs/>
+        <field_list/>
+        <has_preview>false</has_preview>
+        <id>test-sc-checkout</id>
+        <internal>false</internal>
+        <link><![CDATA[function(scope, elem){
+    scope.setFocusToAttachment = function () {
+		setTimeout(function () {
+			var inboxArray = elem.find("a.view-attachment");
+			inboxArray.focus();
+		}, 100);
+	}
+	scope.setFocusToAttachmentButton = function () {
+		elem.find('.sp-attachment-add')[0].focus();
+	}
+}
+	]]></link>
+        <name>Test Catalog Checkout</name>
+        <option_schema/>
+        <public>true</public>
+        <roles/>
+        <script><![CDATA[(function() {
+	var localInput = input; //to safeguard pullution of "input" via BR or other scripts
+	
+	data.action = options.action;
+	if (data.action)
+		data.item = options.item;
+	else
+		data.action = 'checkout';
+	
+	if (localInput && localInput.action == "from_attachment")
+		return;
+	else if (localInput && localInput.action === 'log_request') {
+		$sp.logStat('Order Now Request', localInput.itemDetails.sys_class_name, localInput.itemDetails.sys_id, localInput.itemDetails.name, $sp.getPortalRecord().getUniqueValue());
+		$sp.logStat('Cat Item Request', localInput.itemDetails.sys_class_name, localInput.itemDetails.sys_id, localInput.itemDetails.name, $sp.getPortalRecord().getUniqueValue());
+		return ;
+	}
+
+	var cartName = '';
+	if (localInput)
+		cartName = localInput.cart.name;
+	else if (options.cart)
+		cartName = options.cart.name;
+	
+	//get catalog item names for instrumentation
+	if (data.action == 'order_now') {
+		var catSysId = data.item.sys_id;
+		var gr = new GlideRecord('sc_cat_item');
+		if (gr.get(catSysId))
+			data.item.title = gr.getValue('name');
+	} else if (data.action == 'checkout' && input && input.cart) {
+			var cartData = [];
+			var _data;
+			var cartSysId = input.cart.sys_id;
+			var grCart = new GlideRecord('sc_cart_item');
+			grCart.query("cart", cartSysId);
+			while(grCart.next()){
+				_data = {};
+				var gr2 = new GlideRecord('sc_cat_item');
+				if (gr2.get(grCart.getValue("cat_item"))) {
+					_data.sys_id = gr2.getValue('sys_id');
+					_data.title = gr2.getValue('name');
+					_data.cartID = cartSysId;
+					cartData.push(_data);
+				}
+			}
+		data.cartData = cartData;
+	}
+	
+	var m = data.msgs = {};
+	m.dialogTitle = gs.getMessage("Delete Attachment");
+	m.dialogMessage = gs.getMessage("Are you sure?");
+	m.dialogOK = gs.getMessage("OK");
+	m.dialogCancel = gs.getMessage("Cancel");
+	m.renameSuccessMsg = gs.getMessage("Attachment renamed successfully");
+	m.deleteSuccessMsg = gs.getMessage("Attachment deleted successfully");
+	m.delete_attachment = gs.getMessage("Delete Attachment?");
+	m.requestSubmitted = gs.getMessage("Thank you, your request has been submitted.");
+	m.checkingOutMsg = gs.getMessage("Submitting...");
+	if (data.item.request_method == "request") {
+		m.checkOutMsg = gs.getMessage("Request");
+		m.checkoutPopupTitle = gs.getMessage("Request Confirmation");
+	} else {
+		m.checkOutMsg = gs.getMessage("Checkout");
+		m.checkoutPopupTitle = gs.getMessage("Order Confirmation");
+	}
+	data.isMEE = options.native_mobile == 'true';
+	data.sys_properties = {
+		mobileNativeColor: gs.getProperty("glide.sc.mobile.primary_color", "#1f8476")
+	};
+
+	data.maxAttachmentSize = parseInt(gs.getProperty("com.glide.attachment.max_size", 1024));
+	if (isNaN(data.maxAttachmentSize))
+		data.maxAttachmentSize = 24;
+	m.largeAttachmentMsg = gs.getMessage("Attached files must be smaller than {0} - please try again", "" + data.maxAttachmentSize + "MB");
+	
+	var cartJS;
+	if (data.action !== 'order_now') {
+		cartJS = new sn_sc.CartJS(cartName, '' + gs.getUser().getID());
+		
+		if (localInput && localInput.action === "change_shipping_info") {
+			cartJS.setSpecialInstructions(localInput.special_instructions);
+			cartJS.setRequestedFor(localInput.requestedFor);
+			cartJS.setDeliveryAddress(localInput.deliverTo);
+		}
+	}
+	
+	if (localInput && localInput.action == 'order_guide') {
+		var guideJS = new sn_sc.OrderGuide('' + cartName);
+		cartJS = new sn_sc.CartJS('' + cartName);
+		for(var i = 0; i < localInput.item.items.length; i++) {
+			guideJS.navigateFromMap(localInput.item.items[i]);
+		}
+		cartJS.activateGuide();
+		cartJS.setRequestedFor(localInput.requested_for);
+		cartJS.setDeliveryAddress(localInput.delivery_address);
+		cartJS.setSpecialInstructions(localInput.special_instructions);
+		cartJS.setParentParams(localInput.parentParams);
+		var request = cartJS.checkoutGuide();
+		data.result = {sys_id: request.request_id, number: request.request_number, table: 'sc_request'};
+		var portalId = $sp.getPortalRecord().getUniqueValue();
+		$sp.logStat('Order Now Request', localInput.item.sys_class_name, localInput.item.sys_id, localInput.item.name, portalId);
+		$sp.logStat('Cat Item Request', localInput.item.sys_class_name, localInput.item.sys_id, localInput.item.name, portalId);
+		return;
+	}
+	
+	if (localInput && localInput.action === 'checkout') {
+		checkoutCart(cartJS);
+		return;
+	}
+
+	if (data.action !== 'order_now')
+		data.cart = cartJS.getCartDetails(false);
+	else {
+		var requested_for = {
+			user_id : gs.getUser().getID(),
+			user_name: gs.getUser().getDisplayName()
+		};
+
+		data.cart = {
+			name: cartName,
+			sys_id: gs.generateGUID(),
+			requested_for: requested_for.user_id,
+			requested_for_display_name: requested_for.user_name,
+			delivery_address: sn_sc.CartJS.getRequestedForAddress(requested_for.user_id)
+		};
+	}
+	
+	if (options && options.parentParams) { //if parent is passed
+			data.parentParams = options.parentParams;
+	}
+	if (options && options.requested_for && options.requested_for.id) { //If Passed via options
+			data.cart.requested_for = options.requested_for.id;
+			data.cart.requested_for_display_name = options.requested_for.displayValue;
+			data.cart.delivery_address = sn_sc.CartJS.getRequestedForAddress(options.requested_for.id);
+	}
+
+	if (data.request_for) { //if value is changed by user
+		var user = GlideUser.getUserByID(data.request_for);
+		if (user.exists()) {
+			data.cart.requested_for = data.request_for;
+			data.cart.requested_for_display_name = user.getDisplayName();
+			data.cart.delivery_address = sn_sc.CartJS.getRequestedForAddress(data.request_for);
+		}
+	}
+
+	data.disable_req_for = sn_sc.CartJS.canViewRF();
+	setRequestedForCols(data);
+	data.reqForQuery = gs.getProperty("glide.sc.request_for.query");
+	
+})();
+
+function setRequestedForCols(data) {
+	var reqForDispCols = gs.getProperty("glide.sc.request_for.columns");
+	if (JSUtil.notNil(reqForDispCols)) {
+		data.reqForDispCol = "name";
+		data.reqForDispCols = reqForDispCols.replace(/;/g, ",");
+		data.reqForSearchCols = data.reqForDispCol + "," + data.reqForDispCols;
+	}
+	else {
+		var displayCol = GlideTableDescriptor.get("sys_user").getDisplayName();
+		data.reqForDispCol = displayCol || "name";
+		data.reqForSearchCols = data.reqForDispCol;
+		var refAcCols = GlideTableDescriptor.get("sys_user").getED().getAttribute("ref_ac_columns");
+		if(JSUtil.notNil(refAcCols))
+			data.reqForDispCols = (refAcCols + "").replace(/;/g, ",");
+
+		var refAcSearch = GlideTableDescriptor.get("sys_user").getED().getAttribute("ref_ac_columns_search");
+		if(JSUtil.notNil(data.reqForDispCols) && JSUtil.notNil(refAcSearch) && refAcSearch == "true")
+			data.reqForSearchCols += "," + data.reqForDispCols;
+	}
+}
+
+function checkoutCart(cart) {
+		try {
+				var cartItemGr = cart.getCartItems();
+				data.numberOfCartItems = cartItemGr.getRowCount();
+				var requestedCatItems = new global.GlobalServiceCatalogUtil().findCatItemsForSpLogs(cartItemGr);
+				var request = cart.checkoutCart(true);
+				data.result = {
+						sys_id: request.request_id, 
+						number: request.request_number, 
+						table: 'sc_request'
+				};
+				var portalId = $sp.getPortalRecord().getUniqueValue();
+				$sp.logStat('Checkout Request', 'sc_request', request.request_id, request.request_number, portalId);
+				new global.GlobalServiceCatalogUtil().logRequestedCatItems(requestedCatItems, portalId);
+		} catch(e) {
+				var catalogExceptionUtils = new CatalogExceptionUtils();
+				if(catalogExceptionUtils.isCartException(e))
+						gs.addErrorMessage(e.getMessage());
+				data.numberOfCartItems = 0;
+		}
+}
+
+]]></script>
+        <servicenow>false</servicenow>
+        <sys_class_name>sp_widget</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2021-02-03 16:41:28</sys_created_on>
+        <sys_id>d0697d22070e64102090fd908c1ed06b</sys_id>
+        <sys_mod_count>1</sys_mod_count>
+        <sys_name>Test Catalog Checkout</sys_name>
+        <sys_package display_value="CreateNotes" source="x_snc_createnotes">df5fd9a5090232007f44e1046c8ff69f</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="CreateNotes">df5fd9a5090232007f44e1046c8ff69f</sys_scope>
+        <sys_update_name>sp_widget_d0697d22070e64102090fd908c1ed06b</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2021-02-03 16:44:52</sys_updated_on>
+        <template><![CDATA[<div id="sc_cat_checkout" ng-class="{'panel panel-default': !c.isNative}" sn-atf-blacklist="IS_SERVICE_CATALOG">
+	<h1 class="padder-md h3" ng-if="!c.isNative">{{::checkoutPopupTitle}}
+    <span class="text-base">
+  	  <i class="fa fa-close pull-right text-base" autofocus="true" tabindex="0" ng-click="c.cancel()" aria-label="Close modal"></i>
+     </span>
+  </h1>
+	<div class="wrapper-md clearfix b-t">
+		<div class="form-group">
+			<div class="row">
+				<div class="col-sm-8" ng-class="{'m-t-xl': c.isNative}">
+					<label for="requested-for" ng-class="{'m-l': c.isNative}">${Request For}
+          </label>
+          <i ng-if="!c.isNative" class="fa fa-info-circle" uib-tooltip="${Request for yourself or on behalf of another person}" tooltip-placement="right" tooltip-append-to-body="true" tabindex="0" tooltip-trigger="mouseenter focus" role="tooltip" aria-label="${Request for yourself or on behalf of another person}"></i>
+					<sn-record-picker id="requested-for"
+                            field="c.requestedFor"
+                            table="'sys_user'" 
+                            display-field="c.data.reqForDispCol" 
+                            display-fields="c.data.reqForDispCols" 
+                            value-field="'sys_id'" 
+                            search-fields="c.data.reqForSearchCols"
+                            default-query="c.data.reqForQuery"
+                            page-size="100"
+                            options="{allowClear : false}"
+                            sn-disabled="!c.data.disable_req_for">
+					</sn-record-picker>
+				</div>
+        <div class="padder-v col-sm-12" ng-if="c.allowDeliveryAddress()" ng-class="{'m-t-xl': c.isNative}">
+          <label for="deliver-to" ng-click="c.showDeliveryAddr = !c.showDeliveryAddr" tabindex="0" aria-expanded="{{c.showDeliveryAddr}}" ng-class="{'m-l': c.isNative}">${Delivery Information} <span class="text-muted"> ${(Optional)}</span>
+            <i ng-if="::!c.isNative" ng-class="c.showDeliveryAddr ? 'fa fa-minus-square-o' : 'fa fa-plus-square-o'"  class="m-t-xs pull-left accordion-toggle"></i>
+          </label>
+          <textarea class="form-control" ng-if="c.isNative || c.showDeliveryAddr" 
+                    ng-model="c.deliverTo"  id="deliver-to" ng-model-options="{ updateOn: 'blur' }" 
+                    ng-change="c.changeShippingInfo()" rows="3"></textarea>
+        </div>
+        <div class="col-sm-12" ng-class="{'padder-v': !c.allowDeliveryAddress()}" ng-class="{'m-t-xl': c.isNative}">
+          <label for="special-instructions" ng-click="c.showSpecialInstructions = !c.showSpecialInstructions" tabindex="0" aria-expanded="{{c.showSpecialInstructions}}" ng-class="{'m-l': c.isNative}">${Special Instructions}  <span class="text-muted"> ${(Optional)}</span>
+            <i ng-if="::!c.isNative" ng-class="c.showSpecialInstructions ? 'fa fa-minus-square-o' : 'fa fa-plus-square-o'"  class="m-t-xs pull-left accordion-toggle"></i>
+          </label>
+          <textarea class="form-control" ng-if="c.isNative || c.showSpecialInstructions" 
+                    ng-model="c.special_instructions" id="special-instructions" 
+                    ng-model-options="{ updateOn: 'blur' }" ng-change="c.changeShippingInfo()" rows="3"></textarea>
+        </div>
+		</div>
+    </div>
+	</div>
+  <div ng-if="c.isNative">
+  	<div class="attachment-list" ng-if="c.data.action !== 'order_now'">
+			<now-attachments-list template="sp_attachment_single_line" class="padder-b"></now-attachments-list>
+    </div>
+		<div ng-class="{'flex-center attachment-height': c.isNative}">
+				<label ng-if="c.data.action !== 'order_now'" style="font-weight:normal;cursor:pointer;" class="padding-top-s">
+					<span style="padding-left:28px;">${Add attachments}</span>
+          <sp-attachment-button></sp-attachment-button>
+				</label>
+  	</div>
+  </div>
+	<div class="panel-footer clearfix" ng-if="!c.isNative">
+    <div class="attachment-list" ng-if="c.data.action !== 'order_now'">
+			<now-attachments-list template="sp_attachment_single_line" class="padder-b"></now-attachments-list>
+    </div>
+		<div>
+				<label ng-if="c.data.action !== 'order_now'" style="font-weight:normal;cursor:pointer;" class="padding-top-s">
+					<sp-attachment-button></sp-attachment-button>
+					<span style="padding-left:4px;">${Add attachments}</span>
+				</label>
+			<div class="pull-right">
+				<button name="cancel" ng-disabled="c.checkoutInProgress" ng-click="c.cancel()" class="btn btn-default">${Cancel}</button>
+				<button ng-disabled="c.checkoutInProgress || !c.requestedFor.value" name="submit" ng-click="c.triggerCheckout()" sn-focus="true" class="btn sc-btn btn-primary m-l-xs">
+					<span ng-show="!c.checkoutInProgress">{{::checkOutMsg}}</span>
+					<span ng-show="c.checkoutInProgress">{{::m.checkingOutMsg}}</span>
+				</button>
+			</div>
+		</div>
+	</div>
+</div>]]></template>
+    </sp_widget>
+    <sys_update_version action="INSERT_OR_UPDATE">
+        <action>DELETE</action>
+        <application display_value="CreateNotes">df5fd9a5090232007f44e1046c8ff69f</application>
+        <file_path/>
+        <instance_id>f96a288fdbf0ff000ae3ac44d4961948</instance_id>
+        <instance_name>dev81773</instance_name>
+        <name>sp_widget_d0697d22070e64102090fd908c1ed06b</name>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sp_widget"&gt;&lt;sp_widget action="INSERT_OR_UPDATE"&gt;&lt;category&gt;sc&lt;/category&gt;&lt;client_script&gt;&lt;![CDATA[function($scope, $http, $timeout, $location, spScUtil, nowAttachmentHandler, spUtil, $log, spAriaUtil, $q, spAtf, spModal, spAriaFocusManager, cabrillo, snAnalytics) {
+  var c = this;
+	c.showSpecialInstructions = false;
+	c.showDeliveryAddr = false;
+	c.isNative = cabrillo.isNative() &amp;&amp; c.data.isMEE;
+	
+	c.updateDetails = function() {
+		c.deliverTo = c.data.cart.delivery_address;
+		c.special_instructions = c.data.cart.special_instructions;
+		c.requestedFor = {
+			displayValue: c.data.cart.requested_for_display_name,
+			value: c.data.cart.requested_for,
+			name: 'requested_for'
+		};
+	}
+	
+	
+	spAtf.init().then(function(atf) {
+		$scope._atf = atf;
+		atf.expose('checkout_util', checkoutUtil);
+	});
+	
+	var checkoutUtil = {
+		checkout: function() {
+			var defer = $q.defer();
+			$scope.c.triggerCheckout();
+			var cleanUp;
+			var isOrderGuide = c.data.action == 'order_guide';
+			if(isOrderGuide)
+				cleanUp = $scope.$on('$sp.sc_order_guide.submitted', function(o, result) {
+					$timeout(function() {
+						cleanUp();
+						defer.resolve(result);
+					}, 10);
+				});
+			else
+				cleanUp = $scope.$on('$sp.sc_cat_item.submitted', function(o, result) {
+					$timeout(function() {
+						cleanUp();
+						defer.resolve(result);
+					}, 10);
+				});
+			return defer.promise;
+		}
+	}
+	
+	$scope.$on('dialog.upload_too_large.show', function(e){
+		$log.error($scope.m.largeAttachmentMsg);
+		spUtil.addErrorMessage($scope.m.largeAttachmentMsg);
+	});
+
+	$scope.m = $scope.data.msgs;
+	$scope.checkOutMsg = $scope.m.checkOutMsg;
+	$scope.checkoutPopupTitle = $scope.m.checkoutPopupTitle;
+	
+	displayNativeButtons();
+	
+	var ah = $scope.attachmentHandler = new nowAttachmentHandler(function (attachments, action) {
+		$scope.attachments = attachments;
+		if (action === "added")
+			$scope.setFocusToAttachment();
+		if (action === "renamed")
+			spAriaUtil.sendLiveMessage($scope.m.renameSuccessMsg);
+		if (action === "deleted")
+			spAriaUtil.sendLiveMessage($scope.m.deleteSuccessMsg);
+		spUtil.get($scope, {action: "from_attachment"});
+	}, function (error) {
+		spUtil.addErrorMessage(error.msg + error.fileName);
+	});
+	
+	ah.setParams('sc_cart', c.data.cart.sys_id, 1024 * 1024 * $scope.data.maxAttachmentSize);
+	
+	$scope.attachmentHandler.getAttachmentList();
+
+	$scope.confirmDeleteAttachment = function(attachment) {
+		if (c.isNative) {
+			if (confirm($scope.data.msgs.delete_attachment)) {
+				$scope.attachmentHandler.deleteAttachment(attachment);
+				$scope.setFocusToAttachmentButton();
+			}			
+		} else {
+			spModal.confirm($scope.data.msgs.delete_attachment).then(function() {
+				$scope.attachmentHandler.deleteAttachment(attachment);
+				$scope.setFocusToAttachmentButton();
+			});
+		}
+	}
+
+	c.changeShippingInfo = function() {
+		if (c.data.action !== 'order_now')
+			c.server.get({
+						action: "change_shipping_info",
+						requestedFor: c.requestedFor.value,
+						special_instructions: c.special_instructions,
+						deliverTo: c.deliverTo,
+						cart: {name: c.data.cart.name}
+					}).then(function(response) {
+						c.data.cart = response.data.cart;
+						c.updateDetails();
+					});
+	}
+	
+	c.triggerCheckout = function() {
+		var newURL;
+		c.checkoutInProgress = true;
+		putCheckingOutBtn();
+		var webAnalyticsMsgSuffix = c.isNative ? " - NOW Mobile" : ""; 
+		var additionalParms = {'sysparm_requested_for': c.requestedFor.value,
+													 'special_instructions': c.special_instructions,
+													 'delivery_address': c.deliverTo
+													};
+		if (c.data.parentParams) {
+				additionalParms.sysparm_parent_sys_id =  c.data.parentParams.sysparm_parent_sys_id;
+				additionalParms.sysparm_parent_table = c.data.parentParams.sysparm_parent_table;
+		}
+		if (c.data.action == 'order_now') {
+			spScUtil.orderNow(c.data.item.sys_id, c.data.item.quantity, c.data.item.fields, c.data.item.newRecordID, additionalParms).then(function(response) {
+				$scope.server.get({
+					action: 'log_request',
+					itemDetails: {
+						sys_id: $scope.data.item.sys_id,
+						name: $scope.data.item.name,
+						sys_class_name: $scope.data.item.sys_class_name
+					}
+				});
+				var a = response.data.result;
+				if (!$scope.data.parentParams)
+					$scope.$emit("$$uiNotification", a.$$uiNotification);
+				$scope.$emit("$sp.sc_cat_item.submitted", a);
+				// build and send payload for instrumentation
+				var payload= {};
+				payload.name = "Submit Catalog Request";
+				payload.data = {};
+				payload.data["Catalog Title"] = c.data.item.title;
+				payload.data["Catalog SysID"] = c.data.item.sys_id;
+				payload.data["Shopping Cart"] = "false";
+				snAnalytics.addEvent(payload);
+				
+				if (c.options.auto_redirect == 'false') {
+					$rootScope.$broadcast("$sp.service_catalog.cart.submitted", true);
+					spUtil.addInfoMessage($scope.m.requestSubmitted);
+					return;
+				} else if (!$scope._atf) {
+					removeCabrilloButtons();
+					newURL = $location.search('id=sc_request&amp;is_new_order=true&amp;table=sc_request&amp;sys_id=' + a.sys_id);
+					spAriaFocusManager.navigateToLink(newURL.url());
+				}
+			}, function(response) {
+				c.cancel();
+				if (response.data.result &amp;&amp; response.data.result.errMsg)
+					spUtil.addErrorMessage(response.data.result.errMsg);
+			});
+		} else if (c.data.action == 'order_now_wishlisted_item') {
+			spScUtil.orderWishlistedItem(c.data.item.sys_id, c.data.item.quantity, c.data.item.fields, c.data.item.newRecordID, additionalParms).then(function(response) {
+				$scope.server.get({
+					action: 'log_request',
+					itemDetails: {
+						sys_id: $scope.data.item.sys_id,
+						name: $scope.data.item.name,
+						sys_class_name: $scope.data.item.sys_class_name
+					}
+				});
+				var a = response.data.result;
+				if (!$scope.data.parentParams)
+					$scope.$emit("$$uiNotification", a.$$uiNotification);
+				$scope.$emit("$sp.sc_cat_item.submitted", a);
+				$rootScope.$broadcast("$sp.service_catalog.wishlist.update");
+				if (c.options.auto_redirect == 'false') {
+					$rootScope.$broadcast("$sp.service_catalog.cart.submitted", true);
+					spUtil.addInfoMessage($scope.m.requestSubmitted);
+					return;
+				} else {
+					newURL = $location.search('id=sc_request&amp;is_new_order=true&amp;table=sc_request&amp;sys_id=' + a.sys_id);
+					spAriaFocusManager.navigateToLink(newURL.url());
+				}
+			});
+		}
+		else {
+			c.data.delivery_address = c.deliverTo;
+			c.data.special_instructions = c.special_instructions;
+			c.data.requested_for = c.requestedFor.value;
+			var isOrderGuide = c.data.action == 'order_guide';
+			c.server.update().then(function(response) {
+				if (!response.result)
+					return;
+				
+				// build and send payload for instrumentation
+				var cartData = c.data.cartData;
+				var cartDataLen = c.data.cartData.length;
+				for (var i = 0; i &lt; cartDataLen; i++) {
+					var payload= {};
+					payload.name = "Submit Catalog Request";
+					payload.data = {};
+					payload.data["Catalog Title"] = cartData[i].title;
+					payload.data["Catalog SysID"] = cartData[i].sys_id;
+					payload.data["Catalog Cart SysID"] = cartData[i].cartID;
+					payload.data["Shopping Cart"] = "true";
+					snAnalytics.addEvent(payload);
+				}
+				
+				c.data.action = null;
+				if (isOrderGuide) {
+					window.GlideWebAnalytics.trackEvent("Service Catalog", "Order Guide Request" + webAnalyticsMsgSuffix, "Catalog Request Submitted", $scope.data.item.items.length, 0);
+					$scope.$emit("$sp.sc_order_guide.submitted", $scope.data.result);
+				}
+				else {
+					window.GlideWebAnalytics.trackEvent("Service Catalog", "Catalog Cart" + webAnalyticsMsgSuffix, "Catalog Request Submitted", c.data.numberOfCartItems, 0);
+					$scope.$emit("$sp.cart.submitted", $scope.data.result);
+				}
+				if (c.options.auto_redirect == 'false') {
+					$rootScope.$broadcast("$sp.service_catalog.cart.update");
+					$rootScope.$broadcast("$sp.service_catalog.cart.submitted", true);
+					spUtil.addInfoMessage($scope.m.requestSubmitted);
+					return;
+				}
+				else {
+					if ($scope.data.result.sys_id) 
+						newURL = $location.search('id=sc_request&amp;is_new_order=true&amp;table=sc_request&amp;sys_id=' + $scope.data.result.sys_id);
+					else 
+						newURL = $location.search('id=requests');
+					
+					removeCabrilloButtons();
+					spAriaFocusManager.navigateToLink(newURL.url());
+
+					$timeout(function(){
+						$rootScope.$broadcast("$sp.service_catalog.cart.update");
+						$rootScope.$broadcast("$sp.service_catalog.cart.submitted", true);						
+					})
+
+				}
+			});
+		}
+	}
+
+	$scope.$on("field.change", function(evt, parms) {
+		if (parms.field.name == 'requested_for') {
+			c.data.cart.requested_for = parms.newValue;
+			var getShippingAddrURL = '/api/sn_sc/v1/servicecatalog/cart/delivery_address/' + parms.newValue;
+			$http.get(getShippingAddrURL).then(function handleSuccess(response) {
+				if (response.data.result) {
+					c.deliverTo = response.data.result.trim();
+				} else {
+					c.deliverTo = '';
+				}
+				c.changeShippingInfo();
+			});
+		}
+	});
+
+	c.cancel = function() {
+		if (c.isNative) {
+			cabrillo.viewLayout.setTitle(c.oldTitle);
+			removeCabrilloButtons();
+		}
+		$rootScope.$broadcast("$sp.service_catalog.cart.cancel_order", true);
+	}
+
+	c.allowDeliveryAddress = function () {
+		if (c.data.item)
+			return c.data.item.request_method != "request"
+		return true;
+	}
+	
+	var mespClosePopupUnregister = $rootScope.$on("mesp.popup.close", function() {
+		// Timeout is to give a better user experience otherwise when this popup opens,
+		// the cabrillo buttons will be displayed immediately giving a bad user experience.
+		$timeout(function(){
+			displayNativeButtons();
+		});
+	});
+	
+	var mespOpenPopupUnregister = $rootScope.$on("mesp.popup.open", function() {
+		// Timeout is to give a better user experience otherwise when this popup opens,
+		// the cabrillo buttons will be displayed immediately giving a bad user experience.
+		$timeout(function(){
+			removeCabrilloButtons();
+		});
+	});
+	
+	$scope.$on("$destroy", function() {
+		mespClosePopupUnregister();
+		mespOpenPopupUnregister();
+	});
+	
+	function removeCabrilloButtons() {
+		 if (c.isNative)
+			 cabrillo.viewLayout.setBottomButtons();
+	}
+	
+	function displayNativeButtons() {
+			if (c.isNative) {
+					if (typeof cabrillo.viewLayout.getTitle == 'function') {
+						cabrillo.viewLayout.getTitle().then(function(title) {
+							c.oldTitle = title;
+							cabrillo.viewLayout.setTitle($scope.checkoutPopupTitle);
+						});
+					}
+					var buttons = [
+						{
+							title: $scope.m.dialogCancel,
+							enabled: true,
+							backgroundColor: '#f7f7f7',
+							textColor: '#000000'
+						},
+						{
+							title: $scope.checkOutMsg,
+							enabled: true,
+							backgroundColor: $scope.data.sys_properties.mobileNativeColor,
+							textColor: '#FFFFFF'
+						}
+					];
+					cabrillo.viewLayout.hideBackButton();
+					cabrillo.viewLayout.setNavigationBarButtons();
+					cabrillo.viewLayout.setBottomButtons(buttons, function(buttonIndex) {
+						if (buttonIndex == 0) {
+							c.cancel();
+						}
+						else {
+							c.triggerCheckout();
+						}
+					});
+				}
+	}
+	
+	function putCheckingOutBtn() {
+			if (c.isNative) {
+					var buttons = [
+										{
+												title: $scope.m.dialogCancel,
+												enabled: false,
+											  backgroundColor: '#f7f7f7',
+												textColor: '#000000'
+										},
+										{
+												title: $scope.m.checkingOutMsg,
+												enabled: false,
+												backgroundColor: $scope.data.sys_properties.mobileNativeColor,
+												textColor: '#FFFFFF'
+										}
+								];
+
+			  cabrillo.viewLayout.setBottomButtons(buttons, function(buttonIndex) {});
+			}
+	}
+
+	c.updateDetails();
+}]]&gt;&lt;/client_script&gt;&lt;controller_as&gt;c&lt;/controller_as&gt;&lt;css&gt;.attachment-list {
+  	max-height: 180px;
+  	overflow-y: scroll;
+  	margin-bottom: 10px;
+}
+
+.accordion-toggle {
+  	line-height: 13px;
+}
+
+textarea {
+	resize: vertical;
+}
+
+.select2-additional-display-field {
+  	padding-right: 5px;
+}
+
+.full-height {
+  	height: -webkit-fill-available;
+}
+
+.attachment-height {
+ 		 height: 80px;
+}
+
+.flex-center {
+  	display: flex;
+  	justify-content: center;
+  	align-items: center;
+}
+
+.select2-choice{
+  .select2-arrow {
+    right: 0px !important;
+  }
+}&lt;/css&gt;&lt;data_table&gt;sp_instance&lt;/data_table&gt;&lt;demo_data/&gt;&lt;description/&gt;&lt;docs/&gt;&lt;field_list/&gt;&lt;has_preview&gt;false&lt;/has_preview&gt;&lt;id&gt;test-sc-checkout&lt;/id&gt;&lt;internal&gt;false&lt;/internal&gt;&lt;link&gt;&lt;![CDATA[function(scope, elem){
+    scope.setFocusToAttachment = function () {
+		setTimeout(function () {
+			var inboxArray = elem.find("a.view-attachment");
+			inboxArray.focus();
+		}, 100);
+	}
+	scope.setFocusToAttachmentButton = function () {
+		elem.find('.sp-attachment-add')[0].focus();
+	}
+}
+	]]&gt;&lt;/link&gt;&lt;name&gt;Test Catalog Checkout&lt;/name&gt;&lt;option_schema/&gt;&lt;public&gt;true&lt;/public&gt;&lt;roles/&gt;&lt;script&gt;&lt;![CDATA[(function() {
+	var localInput = input; //to safeguard pullution of "input" via BR or other scripts
+	
+	data.action = options.action;
+	if (data.action)
+		data.item = options.item;
+	else
+		data.action = 'checkout';
+	
+	if (localInput &amp;&amp; localInput.action == "from_attachment")
+		return;
+	else if (localInput &amp;&amp; localInput.action === 'log_request') {
+		$sp.logStat('Order Now Request', localInput.itemDetails.sys_class_name, localInput.itemDetails.sys_id, localInput.itemDetails.name, $sp.getPortalRecord().getUniqueValue());
+		$sp.logStat('Cat Item Request', localInput.itemDetails.sys_class_name, localInput.itemDetails.sys_id, localInput.itemDetails.name, $sp.getPortalRecord().getUniqueValue());
+		return ;
+	}
+
+	var cartName = '';
+	if (localInput)
+		cartName = localInput.cart.name;
+	else if (options.cart)
+		cartName = options.cart.name;
+	
+	//get catalog item names for instrumentation
+	if (data.action == 'order_now') {
+		var catSysId = data.item.sys_id;
+		var gr = new GlideRecord('sc_cat_item');
+		if (gr.get(catSysId))
+			data.item.title = gr.getValue('name');
+	} else if (data.action == 'checkout' &amp;&amp; input &amp;&amp; input.cart) {
+			var cartData = [];
+			var _data;
+			var cartSysId = input.cart.sys_id;
+			var grCart = new GlideRecord('sc_cart_item');
+			grCart.query("cart", cartSysId);
+			while(grCart.next()){
+				_data = {};
+				var gr2 = new GlideRecord('sc_cat_item');
+				if (gr2.get(grCart.getValue("cat_item"))) {
+					_data.sys_id = gr2.getValue('sys_id');
+					_data.title = gr2.getValue('name');
+					_data.cartID = cartSysId;
+					cartData.push(_data);
+				}
+			}
+		data.cartData = cartData;
+	}
+	
+	var m = data.msgs = {};
+	m.dialogTitle = gs.getMessage("Delete Attachment");
+	m.dialogMessage = gs.getMessage("Are you sure?");
+	m.dialogOK = gs.getMessage("OK");
+	m.dialogCancel = gs.getMessage("Cancel");
+	m.renameSuccessMsg = gs.getMessage("Attachment renamed successfully");
+	m.deleteSuccessMsg = gs.getMessage("Attachment deleted successfully");
+	m.delete_attachment = gs.getMessage("Delete Attachment?");
+	m.requestSubmitted = gs.getMessage("Thank you, your request has been submitted.");
+	m.checkingOutMsg = gs.getMessage("Submitting...");
+	if (data.item.request_method == "request") {
+		m.checkOutMsg = gs.getMessage("Request");
+		m.checkoutPopupTitle = gs.getMessage("Request Confirmation");
+	} else {
+		m.checkOutMsg = gs.getMessage("Checkout");
+		m.checkoutPopupTitle = gs.getMessage("Order Confirmation");
+	}
+	data.isMEE = options.native_mobile == 'true';
+	data.sys_properties = {
+		mobileNativeColor: gs.getProperty("glide.sc.mobile.primary_color", "#1f8476")
+	};
+
+	data.maxAttachmentSize = parseInt(gs.getProperty("com.glide.attachment.max_size", 1024));
+	if (isNaN(data.maxAttachmentSize))
+		data.maxAttachmentSize = 24;
+	m.largeAttachmentMsg = gs.getMessage("Attached files must be smaller than {0} - please try again", "" + data.maxAttachmentSize + "MB");
+	
+	var cartJS;
+	if (data.action !== 'order_now') {
+		cartJS = new sn_sc.CartJS(cartName, '' + gs.getUser().getID());
+		
+		if (localInput &amp;&amp; localInput.action === "change_shipping_info") {
+			cartJS.setSpecialInstructions(localInput.special_instructions);
+			cartJS.setRequestedFor(localInput.requestedFor);
+			cartJS.setDeliveryAddress(localInput.deliverTo);
+		}
+	}
+	
+	if (localInput &amp;&amp; localInput.action == 'order_guide') {
+		var guideJS = new sn_sc.OrderGuide('' + cartName);
+		cartJS = new sn_sc.CartJS('' + cartName);
+		for(var i = 0; i &lt; localInput.item.items.length; i++) {
+			guideJS.navigateFromMap(localInput.item.items[i]);
+		}
+		cartJS.activateGuide();
+		cartJS.setRequestedFor(localInput.requested_for);
+		cartJS.setDeliveryAddress(localInput.delivery_address);
+		cartJS.setSpecialInstructions(localInput.special_instructions);
+		cartJS.setParentParams(localInput.parentParams);
+		var request = cartJS.checkoutGuide();
+		data.result = {sys_id: request.request_id, number: request.request_number, table: 'sc_request'};
+		var portalId = $sp.getPortalRecord().getUniqueValue();
+		$sp.logStat('Order Now Request', localInput.item.sys_class_name, localInput.item.sys_id, localInput.item.name, portalId);
+		$sp.logStat('Cat Item Request', localInput.item.sys_class_name, localInput.item.sys_id, localInput.item.name, portalId);
+		return;
+	}
+	
+	if (localInput &amp;&amp; localInput.action === 'checkout') {
+		checkoutCart(cartJS);
+		return;
+	}
+
+	if (data.action !== 'order_now')
+		data.cart = cartJS.getCartDetails(false);
+	else {
+		var requested_for = {
+			user_id : gs.getUser().getID(),
+			user_name: gs.getUser().getDisplayName()
+		};
+
+		data.cart = {
+			name: cartName,
+			sys_id: gs.generateGUID(),
+			requested_for: requested_for.user_id,
+			requested_for_display_name: requested_for.user_name,
+			delivery_address: sn_sc.CartJS.getRequestedForAddress(requested_for.user_id)
+		};
+	}
+	
+	if (options &amp;&amp; options.parentParams) { //if parent is passed
+			data.parentParams = options.parentParams;
+	}
+	if (options &amp;&amp; options.requested_for &amp;&amp; options.requested_for.id) { //If Passed via options
+			data.cart.requested_for = options.requested_for.id;
+			data.cart.requested_for_display_name = options.requested_for.displayValue;
+			data.cart.delivery_address = sn_sc.CartJS.getRequestedForAddress(options.requested_for.id);
+	}
+
+	if (data.request_for) { //if value is changed by user
+		var user = GlideUser.getUserByID(data.request_for);
+		if (user.exists()) {
+			data.cart.requested_for = data.request_for;
+			data.cart.requested_for_display_name = user.getDisplayName();
+			data.cart.delivery_address = sn_sc.CartJS.getRequestedForAddress(data.request_for);
+		}
+	}
+
+	data.disable_req_for = sn_sc.CartJS.canViewRF();
+	setRequestedForCols(data);
+	data.reqForQuery = gs.getProperty("glide.sc.request_for.query");
+	
+})();
+
+function setRequestedForCols(data) {
+	var reqForDispCols = gs.getProperty("glide.sc.request_for.columns");
+	if (JSUtil.notNil(reqForDispCols)) {
+		data.reqForDispCol = "name";
+		data.reqForDispCols = reqForDispCols.replace(/;/g, ",");
+		data.reqForSearchCols = data.reqForDispCol + "," + data.reqForDispCols;
+	}
+	else {
+		var displayCol = GlideTableDescriptor.get("sys_user").getDisplayName();
+		data.reqForDispCol = displayCol || "name";
+		data.reqForSearchCols = data.reqForDispCol;
+		var refAcCols = GlideTableDescriptor.get("sys_user").getED().getAttribute("ref_ac_columns");
+		if(JSUtil.notNil(refAcCols))
+			data.reqForDispCols = (refAcCols + "").replace(/;/g, ",");
+
+		var refAcSearch = GlideTableDescriptor.get("sys_user").getED().getAttribute("ref_ac_columns_search");
+		if(JSUtil.notNil(data.reqForDispCols) &amp;&amp; JSUtil.notNil(refAcSearch) &amp;&amp; refAcSearch == "true")
+			data.reqForSearchCols += "," + data.reqForDispCols;
+	}
+}
+
+function checkoutCart(cart) {
+		try {
+				var cartItemGr = cart.getCartItems();
+				data.numberOfCartItems = cartItemGr.getRowCount();
+				var requestedCatItems = new global.GlobalServiceCatalogUtil().findCatItemsForSpLogs(cartItemGr);
+				var request = cart.checkoutCart(true);
+				data.result = {
+						sys_id: request.request_id, 
+						number: request.request_number, 
+						table: 'sc_request'
+				};
+				var portalId = $sp.getPortalRecord().getUniqueValue();
+				$sp.logStat('Checkout Request', 'sc_request', request.request_id, request.request_number, portalId);
+				new global.GlobalServiceCatalogUtil().logRequestedCatItems(requestedCatItems, portalId);
+		} catch(e) {
+				var catalogExceptionUtils = new CatalogExceptionUtils();
+				if(catalogExceptionUtils.isCartException(e))
+						gs.addErrorMessage(e.getMessage());
+				data.numberOfCartItems = 0;
+		}
+}
+
+]]&gt;&lt;/script&gt;&lt;servicenow&gt;false&lt;/servicenow&gt;&lt;sys_class_name&gt;sp_widget&lt;/sys_class_name&gt;&lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;&lt;sys_created_on&gt;2021-02-03 16:41:28&lt;/sys_created_on&gt;&lt;sys_id&gt;d0697d22070e64102090fd908c1ed06b&lt;/sys_id&gt;&lt;sys_mod_count&gt;1&lt;/sys_mod_count&gt;&lt;sys_name&gt;Test Catalog Checkout&lt;/sys_name&gt;&lt;sys_package display_value="CreateNotes" source="x_snc_createnotes"&gt;df5fd9a5090232007f44e1046c8ff69f&lt;/sys_package&gt;&lt;sys_policy/&gt;&lt;sys_scope display_value="CreateNotes"&gt;df5fd9a5090232007f44e1046c8ff69f&lt;/sys_scope&gt;&lt;sys_update_name&gt;sp_widget_d0697d22070e64102090fd908c1ed06b&lt;/sys_update_name&gt;&lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;&lt;sys_updated_on&gt;2021-02-03 16:44:52&lt;/sys_updated_on&gt;&lt;template&gt;&lt;![CDATA[&lt;div id="sc_cat_checkout" ng-class="{'panel panel-default': !c.isNative}" sn-atf-blacklist="IS_SERVICE_CATALOG"&gt;
+	&lt;h1 class="padder-md h3" ng-if="!c.isNative"&gt;{{::checkoutPopupTitle}}
+    &lt;span class="text-base"&gt;
+  	  &lt;i class="fa fa-close pull-right text-base" autofocus="true" tabindex="0" ng-click="c.cancel()" aria-label="Close modal"&gt;&lt;/i&gt;
+     &lt;/span&gt;
+  &lt;/h1&gt;
+	&lt;div class="wrapper-md clearfix b-t"&gt;
+		&lt;div class="form-group"&gt;
+			&lt;div class="row"&gt;
+				&lt;div class="col-sm-8" ng-class="{'m-t-xl': c.isNative}"&gt;
+					&lt;label for="requested-for" ng-class="{'m-l': c.isNative}"&gt;${Request For}
+          &lt;/label&gt;
+          &lt;i ng-if="!c.isNative" class="fa fa-info-circle" uib-tooltip="${Request for yourself or on behalf of another person}" tooltip-placement="right" tooltip-append-to-body="true" tabindex="0" tooltip-trigger="mouseenter focus" role="tooltip" aria-label="${Request for yourself or on behalf of another person}"&gt;&lt;/i&gt;
+					&lt;sn-record-picker id="requested-for"
+                            field="c.requestedFor"
+                            table="'sys_user'" 
+                            display-field="c.data.reqForDispCol" 
+                            display-fields="c.data.reqForDispCols" 
+                            value-field="'sys_id'" 
+                            search-fields="c.data.reqForSearchCols"
+                            default-query="c.data.reqForQuery"
+                            page-size="100"
+                            options="{allowClear : false}"
+                            sn-disabled="!c.data.disable_req_for"&gt;
+					&lt;/sn-record-picker&gt;
+				&lt;/div&gt;
+        &lt;div class="padder-v col-sm-12" ng-if="c.allowDeliveryAddress()" ng-class="{'m-t-xl': c.isNative}"&gt;
+          &lt;label for="deliver-to" ng-click="c.showDeliveryAddr = !c.showDeliveryAddr" tabindex="0" aria-expanded="{{c.showDeliveryAddr}}" ng-class="{'m-l': c.isNative}"&gt;${Delivery Information} &lt;span class="text-muted"&gt; ${(Optional)}&lt;/span&gt;
+            &lt;i ng-if="::!c.isNative" ng-class="c.showDeliveryAddr ? 'fa fa-minus-square-o' : 'fa fa-plus-square-o'"  class="m-t-xs pull-left accordion-toggle"&gt;&lt;/i&gt;
+          &lt;/label&gt;
+          &lt;textarea class="form-control" ng-if="c.isNative || c.showDeliveryAddr" 
+                    ng-model="c.deliverTo"  id="deliver-to" ng-model-options="{ updateOn: 'blur' }" 
+                    ng-change="c.changeShippingInfo()" rows="3"&gt;&lt;/textarea&gt;
+        &lt;/div&gt;
+        &lt;div class="col-sm-12" ng-class="{'padder-v': !c.allowDeliveryAddress()}" ng-class="{'m-t-xl': c.isNative}"&gt;
+          &lt;label for="special-instructions" ng-click="c.showSpecialInstructions = !c.showSpecialInstructions" tabindex="0" aria-expanded="{{c.showSpecialInstructions}}" ng-class="{'m-l': c.isNative}"&gt;${Special Instructions}  &lt;span class="text-muted"&gt; ${(Optional)}&lt;/span&gt;
+            &lt;i ng-if="::!c.isNative" ng-class="c.showSpecialInstructions ? 'fa fa-minus-square-o' : 'fa fa-plus-square-o'"  class="m-t-xs pull-left accordion-toggle"&gt;&lt;/i&gt;
+          &lt;/label&gt;
+          &lt;textarea class="form-control" ng-if="c.isNative || c.showSpecialInstructions" 
+                    ng-model="c.special_instructions" id="special-instructions" 
+                    ng-model-options="{ updateOn: 'blur' }" ng-change="c.changeShippingInfo()" rows="3"&gt;&lt;/textarea&gt;
+        &lt;/div&gt;
+		&lt;/div&gt;
+    &lt;/div&gt;
+	&lt;/div&gt;
+  &lt;div ng-if="c.isNative"&gt;
+  	&lt;div class="attachment-list" ng-if="c.data.action !== 'order_now'"&gt;
+			&lt;now-attachments-list template="sp_attachment_single_line" class="padder-b"&gt;&lt;/now-attachments-list&gt;
+    &lt;/div&gt;
+		&lt;div ng-class="{'flex-center attachment-height': c.isNative}"&gt;
+				&lt;label ng-if="c.data.action !== 'order_now'" style="font-weight:normal;cursor:pointer;" class="padding-top-s"&gt;
+					&lt;span style="padding-left:28px;"&gt;${Add attachments}&lt;/span&gt;
+          &lt;sp-attachment-button&gt;&lt;/sp-attachment-button&gt;
+				&lt;/label&gt;
+  	&lt;/div&gt;
+  &lt;/div&gt;
+	&lt;div class="panel-footer clearfix" ng-if="!c.isNative"&gt;
+    &lt;div class="attachment-list" ng-if="c.data.action !== 'order_now'"&gt;
+			&lt;now-attachments-list template="sp_attachment_single_line" class="padder-b"&gt;&lt;/now-attachments-list&gt;
+    &lt;/div&gt;
+		&lt;div&gt;
+				&lt;label ng-if="c.data.action !== 'order_now'" style="font-weight:normal;cursor:pointer;" class="padding-top-s"&gt;
+					&lt;sp-attachment-button&gt;&lt;/sp-attachment-button&gt;
+					&lt;span style="padding-left:4px;"&gt;${Add attachments}&lt;/span&gt;
+				&lt;/label&gt;
+			&lt;div class="pull-right"&gt;
+				&lt;button name="cancel" ng-disabled="c.checkoutInProgress" ng-click="c.cancel()" class="btn btn-default"&gt;${Cancel}&lt;/button&gt;
+				&lt;button ng-disabled="c.checkoutInProgress || !c.requestedFor.value" name="submit" ng-click="c.triggerCheckout()" sn-focus="true" class="btn sc-btn btn-primary m-l-xs"&gt;
+					&lt;span ng-show="!c.checkoutInProgress"&gt;{{::checkOutMsg}}&lt;/span&gt;
+					&lt;span ng-show="c.checkoutInProgress"&gt;{{::m.checkingOutMsg}}&lt;/span&gt;
+				&lt;/button&gt;
+			&lt;/div&gt;
+		&lt;/div&gt;
+	&lt;/div&gt;
+&lt;/div&gt;]]&gt;&lt;/template&gt;&lt;/sp_widget&gt;&lt;/record_update&gt;</payload>
+        <payload_hash>1446055440</payload_hash>
+        <record_name>Test Catalog Checkout</record_name>
+        <reverted_from/>
+        <source>26952591070aa0102090fd908c1ed0c6</source>
+        <source_table>sys_update_set</source_table>
+        <state>previous</state>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2021-02-03 16:44:53</sys_created_on>
+        <sys_id>922ab562070e64102090fd908c1ed076</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_recorded_at>17768c84bf70000001</sys_recorded_at>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2021-02-03 16:44:53</sys_updated_on>
+        <type>Widget</type>
+        <update_guid>da2ab5621e0e641009d8b1269aba4775</update_guid>
+        <update_guid_history>da2ab5621e0e641009d8b1269aba4775:1446055440,98697d22340e6410a5a55a79a5e21d6c:-1713833729</update_guid_history>
+    </sys_update_version>
+    <sys_metadata_delete action="INSERT_OR_UPDATE">
+        <sys_audit_delete display_value="Test Catalog Checkout">7d2b35a2070e64102090fd908c1ed0f8</sys_audit_delete>
+        <sys_class_name>sys_metadata_delete</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2021-02-03 16:49:13</sys_created_on>
+        <sys_db_object display_value="" name="sp_widget">sp_widget</sys_db_object>
+        <sys_id>3e83e0ce69e04018b95ff01885431544</sys_id>
+        <sys_metadata>d0697d22070e64102090fd908c1ed06b</sys_metadata>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Test Catalog Checkout</sys_name>
+        <sys_package display_value="CreateNotes" source="x_snc_createnotes">df5fd9a5090232007f44e1046c8ff69f</sys_package>
+        <sys_parent/>
+        <sys_policy/>
+        <sys_scope display_value="CreateNotes">df5fd9a5090232007f44e1046c8ff69f</sys_scope>
+        <sys_scope_delete display_value="">64daa03572704d49a928bf08a985d6f9</sys_scope_delete>
+        <sys_update_name>sp_widget_d0697d22070e64102090fd908c1ed06b</sys_update_name>
+        <sys_update_version display_value="sp_widget_d0697d22070e64102090fd908c1ed06b">922ab562070e64102090fd908c1ed076</sys_update_version>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2021-02-03 16:49:13</sys_updated_on>
+    </sys_metadata_delete>
+</record_update>
